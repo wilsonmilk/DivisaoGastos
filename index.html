@@ -3,16 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <!-- Tags para funcionar como App Nativo no iPhone -->
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>Divisor de Fatura</title>
     
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- PDF.js para ler a fatura do Nubank em PDF -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
-    <!-- jsPDF para exportar o relatório -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
 
@@ -23,14 +19,12 @@
 <body class="bg-gray-50 text-gray-800 font-sans antialiased pb-24">
 
     <div class="max-w-md mx-auto bg-white min-h-screen shadow-2xl">
-        <!-- Header -->
         <div class="bg-[#8A05BE] text-white p-6 rounded-b-[2rem] shadow-lg">
             <h1 class="text-2xl font-bold tracking-tight">Divisor de Fatura</h1>
             <p class="text-sm text-purple-200 mt-1 font-medium">Organize os gastos rapidinho</p>
         </div>
 
         <div class="p-6 space-y-6" id="setup-screen">
-            <!-- Configuração de Nomes -->
             <div class="space-y-3">
                 <h2 class="text-lg font-bold text-gray-800">1. Defina as Categorias</h2>
                 <div class="grid grid-cols-2 gap-4">
@@ -39,7 +33,6 @@
                 </div>
             </div>
 
-            <!-- Upload -->
             <div class="space-y-3">
                 <h2 class="text-lg font-bold text-gray-800">2. Importar Extratos</h2>
                 <label class="flex flex-col items-center justify-center w-full h-36 border-2 border-dashed border-[#8A05BE] rounded-2xl cursor-pointer bg-purple-50 hover:bg-purple-100 transition shadow-sm text-center px-4">
@@ -55,16 +48,13 @@
             </button>
         </div>
 
-        <!-- Tela do Quiz -->
         <div class="p-5 hidden space-y-5" id="quiz-screen">
             <div class="flex justify-between items-center bg-gray-50 p-3 rounded-xl border border-gray-100">
                 <h2 class="text-lg font-bold text-gray-800">Atribuir Gastos</h2>
                 <span class="bg-purple-100 text-[#8A05BE] text-sm font-black px-3 py-1 rounded-lg" id="progress-badge">0/0</span>
             </div>
             
-            <div id="items-container" class="space-y-4">
-                <!-- Itens serão injetados aqui -->
-            </div>
+            <div id="items-container" class="space-y-4"></div>
 
             <button onclick="exportToPDF()" class="w-full bg-emerald-500 text-white font-bold text-lg py-4 rounded-2xl shadow-lg mt-8 hover:bg-emerald-600 transition flex justify-center items-center gap-2">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
@@ -73,7 +63,6 @@
         </div>
     </div>
 
-    <!-- Footer Fixado com Totais -->
     <div class="fixed bottom-0 w-full max-w-md bg-white border-t border-gray-100 shadow-[0_-10px_15px_-3px_rgba(0,0,0,0.05)] p-5 flex justify-between items-center z-50 rounded-t-3xl">
         <div class="flex-1">
             <p class="text-[11px] uppercase tracking-wider text-gray-400 font-bold" id="label-cat1">Cat 1</p>
@@ -108,23 +97,79 @@
             document.getElementById('setup-screen').classList.add('hidden');
             document.getElementById('quiz-screen').classList.remove('hidden');
 
-            expenses = [];
+            let rawExpenses = []; 
             
             for (let file of files) {
                 const fileName = file.name.toLowerCase();
-                
                 if (fileName.endsWith('.pdf')) {
-                    await parsePDF(file);
+                    await parsePDF(file, rawExpenses);
                 } else if (fileName.endsWith('.csv')) {
-                    await parseCSV(file);
+                    await parseCSV(file, rawExpenses);
                 } else if (fileName.endsWith('.ofx')) {
-                    await parseOFX(file);
+                    await parseOFX(file, rawExpenses);
                 }
             }
+            
+            let balanceItemsSum = 0;
+            const balanceKeywords = [
+                "pagamento recebido", "pagamento em ", "pagamento da fatura",
+                "valor pendente", "multa por fatura", "iof por fatura atrasada", 
+                "juros", "encargos"
+            ];
+
+            expenses = [];
+            
+            for (let item of rawExpenses) {
+                let descLower = item.desc.toLowerCase();
+                let isBalance = balanceKeywords.some(k => descLower.includes(k));
+                
+                if (isBalance && descLower.includes("iof") && !descLower.includes("atrasada")) {
+                    isBalance = false; 
+                }
+
+                if (isBalance) {
+                    balanceItemsSum += item.rawValue; 
+                } else {
+                    let absValue = Math.abs(item.rawValue);
+                    if (absValue > 0) {
+                        let descClean = item.desc;
+                        let installment = null;
+                        
+                        // NOVIDADE: Extração inteligente das Parcelas (ex: " - Parcela 10/12")
+                        const instMatch = descClean.match(/(?:\s*-\s*)?Parcela\s+(\d+)\/(\d+)/i);
+                        if (instMatch) {
+                            installment = `${instMatch[1]} de ${instMatch[2]}`;
+                            // Remove a info de parcela do nome para ficar limpo
+                            descClean = descClean.replace(instMatch[0], '').trim();
+                        }
+
+                        expenses.push({ 
+                            id: Math.random().toString(36).substr(2, 9), 
+                            date: item.date, 
+                            desc: descClean, 
+                            value: absValue, 
+                            assignedTo: null,
+                            installment: installment
+                        });
+                    }
+                }
+            }
+
+            if (Math.abs(balanceItemsSum) > 0.02) { 
+                expenses.push({
+                    id: "saldo-atraso",
+                    date: "Ajuste",
+                    desc: "Resíduo (Multas, Juros e Saldo Anterior)",
+                    value: Math.abs(balanceItemsSum),
+                    assignedTo: null,
+                    installment: null
+                });
+            }
+
             renderQuiz();
         }
 
-        async function parsePDF(file) {
+        async function parsePDF(file, rawExpenses) {
             const arrayBuffer = await file.arrayBuffer();
             const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
             
@@ -133,21 +178,19 @@
                 const textContent = await page.getTextContent();
                 const fullText = textContent.items.map(item => item.str).join(' ');
 
-                const regex = /(\d{2}\s+[A-Z]{3})\s+(.*?)\s+R\$\s*(\d+[.,]\d{2})/g;
+                const regex = /(\d{2}\s+[A-Z]{3})\s+(.*?)\s+(-)?\s*R\$\s*([\d.,]+)/g;
                 let match;
-                
                 while ((match = regex.exec(fullText)) !== null) {
                     const date = match[1].trim();
                     const desc = match[2].trim();
-                    if(desc.toLowerCase().includes("pagamento em")) continue; 
-                    
-                    const value = parseFloat(match[3].replace('.', '').replace(',', '.'));
-                    expenses.push({ id: Math.random().toString(36).substr(2, 9), date, desc, value, assignedTo: null });
+                    const sign = match[3] === '-' ? -1 : 1;
+                    const value = sign * parseFloat(match[4].replace('.', '').replace(',', '.'));
+                    rawExpenses.push({ date, desc, rawValue: value });
                 }
             }
         }
 
-        async function parseCSV(file) {
+        async function parseCSV(file, rawExpenses) {
             const text = await file.text();
             const lines = text.split('\n').filter(l => l.trim() !== '');
             if (lines.length < 2) return;
@@ -157,13 +200,9 @@
             
             let dateIdx = 0, descIdx = -1, valIdx = -1;
 
-            // Busca inteligente de colunas
             if (headers.includes('identificador') && headers.includes('descrição')) {
                 descIdx = headers.indexOf('descrição');
                 valIdx = headers.indexOf('valor');
-            } else if (headers.includes('category') && headers.includes('title')) {
-                descIdx = headers.indexOf('title');
-                valIdx = headers.indexOf('amount');
             } else {
                 headers.forEach((h, i) => {
                     if (h.includes('title') || h.includes('título') || h.includes('descri') || h.includes('historico')) descIdx = i;
@@ -181,13 +220,12 @@
                     const date = cols[dateIdx] || "";
                     let desc = cols[descIdx] || "Sem Nome";
                     
-                    // Prevenção extra: se a descrição for apenas números (como no print), pega a coluna vizinha
                     if (!isNaN(parseFloat(desc.replace(',', '.'))) && cols.length > descIdx + 1) {
                         desc = cols[descIdx + 1] || cols[descIdx - 1]; 
                     }
 
                     let valStr = cols[valIdx] || "0";
-                    valStr = valStr.replace(/[R$\s]/g, '');
+                    valStr = valStr.replace(/[R$\s]/g, ''); 
                     
                     if (valStr.includes(',') && valStr.split(',')[1].length <= 2) {
                         valStr = valStr.replace(/\./g, '').replace(',', '.');
@@ -196,17 +234,14 @@
                     }
                     
                     let value = parseFloat(valStr);
-                    if (isNaN(value)) continue;
-                    if (value < 0) value = Math.abs(value);
-                    
-                    if (value > 0 && !desc.toLowerCase().includes("pagamento")) {
-                        expenses.push({ id: Math.random().toString(36).substr(2, 9), date, desc, value, assignedTo: null });
+                    if (!isNaN(value) && value !== 0) {
+                        rawExpenses.push({ date, desc, rawValue: value });
                     }
                 }
             }
         }
 
-        async function parseOFX(file) {
+        async function parseOFX(file, rawExpenses) {
             const text = await file.text();
             const trnRegex = /<STMTTRN>([\s\S]*?)<\/STMTTRN>/gi;
             let match;
@@ -219,18 +254,13 @@
                 
                 if (amtMatch && memoMatch) {
                     let value = parseFloat(amtMatch[1]);
-                    if (value < 0) {
-                        value = Math.abs(value);
-                        const desc = memoMatch[1].trim();
-                        let date = "Data";
-                        if (dateMatch) {
-                            const d = dateMatch[1];
-                            date = `${d.substring(6,8)}/${d.substring(4,6)}/${d.substring(0,4)}`;
-                        }
-                        if (!desc.toLowerCase().includes("pagamento")) {
-                            expenses.push({ id: Math.random().toString(36).substr(2, 9), date, desc, value, assignedTo: null });
-                        }
+                    const desc = memoMatch[1].trim();
+                    let date = "Data";
+                    if (dateMatch) {
+                        const d = dateMatch[1];
+                        date = `${d.substring(6,8)}/${d.substring(4,6)}/${d.substring(0,4)}`;
                     }
+                    rawExpenses.push({ date, desc, rawValue: value });
                 }
             }
         }
@@ -248,15 +278,19 @@
                 const div = document.createElement('div');
                 div.className = "bg-white border border-gray-100 rounded-2xl p-5 shadow-sm transition-all";
                 
+                // NOVIDADE: O HTML agora renderiza a etiqueta de parcela (se existir) ao lado da data
                 div.innerHTML = `
-                    <div class="flex justify-between items-start mb-4 gap-3">
+                    <div class="flex justify-between items-start mb-3 gap-3">
                         <div class="flex-1 min-w-0">
-                            <span class="text-[11px] text-gray-400 font-bold uppercase tracking-wider bg-gray-50 px-2 py-1 rounded-md">${item.date}</span>
-                            <p class="text-base font-bold text-gray-800 leading-snug mt-2 truncate">${item.desc}</p>
+                            <div class="flex items-center gap-2 mb-2 flex-wrap">
+                                <span class="text-[11px] text-gray-400 font-bold uppercase tracking-wider bg-gray-50 px-2 py-1 rounded-md">${item.date}</span>
+                                ${item.installment ? `<span class="text-[10px] text-blue-600 font-bold uppercase tracking-wider bg-blue-50 border border-blue-100 px-2 py-1 rounded-md">Parc. ${item.installment}</span>` : ''}
+                            </div>
+                            <p class="text-base font-bold text-gray-800 leading-snug truncate">${item.desc}</p>
                         </div>
                         <span class="text-lg font-black text-gray-900 whitespace-nowrap bg-purple-50 text-[#8A05BE] px-3 py-1.5 rounded-xl">R$ ${item.value.toFixed(2).replace('.', ',')}</span>
                     </div>
-                    <div class="grid grid-cols-2 gap-3 mt-1">
+                    <div class="grid grid-cols-2 gap-3 mt-2">
                         <button onclick="assignItem('${item.id}', 'cat1')" class="py-3 rounded-xl text-sm font-bold border-2 transition-all ${item.assignedTo === 'cat1' ? 'bg-[#8A05BE] text-white border-[#8A05BE] shadow-md transform scale-[1.02]' : 'bg-white text-gray-600 border-gray-100 hover:border-gray-200'}">
                             ${category1}
                         </button>
@@ -305,12 +339,17 @@
             doc.text(`Total ${category1}: R$ ${totals.cat1.toFixed(2).replace('.', ',')}`, 14, 40);
             doc.text(`Total ${category2}: R$ ${totals.cat2.toFixed(2).replace('.', ',')}`, 14, 46);
 
-            const tableData = expenses.map(item => [
-                item.date,
-                item.desc,
-                item.assignedTo === 'cat1' ? category1 : (item.assignedTo === 'cat2' ? category2 : 'Não atribuído'),
-                `R$ ${item.value.toFixed(2).replace('.', ',')}`
-            ]);
+            const tableData = expenses.map(item => {
+                // NOVIDADE: Adiciona a info de parcela na quebra de linha do PDF
+                const finalDesc = item.installment ? `${item.desc}\n(Parcela ${item.installment})` : item.desc;
+                
+                return [
+                    item.date,
+                    finalDesc,
+                    item.assignedTo === 'cat1' ? category1 : (item.assignedTo === 'cat2' ? category2 : 'Não atribuído'),
+                    `R$ ${item.value.toFixed(2).replace('.', ',')}`
+                ];
+            });
 
             doc.autoTable({
                 startY: 54,
@@ -318,7 +357,7 @@
                 body: tableData,
                 theme: 'striped',
                 headStyles: { fillColor: [138, 5, 190], textColor: [255, 255, 255], fontStyle: 'bold' },
-                styles: { fontSize: 10, cellPadding: 4 },
+                styles: { fontSize: 10, cellPadding: 4, valign: 'middle' },
                 alternateRowStyles: { fillColor: [250, 245, 255] }
             });
 
