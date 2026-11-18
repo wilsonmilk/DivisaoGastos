@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <!-- Tags para funcionar como App Nativo no iPhone -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Divisor de Fatura</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- PDF.js para ler a fatura do Nubank -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <!-- jsPDF para exportar o relatório -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+
+    <script>
+        // Configuração do worker do PDF.js
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+    </script>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans antialiased pb-24">
+
+    <div class="max-w-md mx-auto bg-white min-h-screen shadow-lg">
+        <!-- Header -->
+        <div class="bg-purple-700 text-white p-6 rounded-b-3xl shadow-md">
+            <h1 class="text-2xl font-bold">Divisor de Fatura</h1>
+            <p class="text-sm opacity-80 mt-1">Organize os gastos rapidinho</p>
+        </div>
+
+        <div class="p-6 space-y-6" id="setup-screen">
+            <!-- Configuração de Nomes -->
+            <div class="space-y-4">
+                <h2 class="text-lg font-semibold text-gray-700">1. Defina as Categorias</h2>
+                <div class="grid grid-cols-2 gap-4">
+                    <input type="text" id="cat1" value="Meu Gasto" class="border rounded-xl p-3 w-full outline-none focus:ring-2 focus:ring-purple-500" placeholder="Ex: Wilson">
+                    <input type="text" id="cat2" value="Casamento" class="border rounded-xl p-3 w-full outline-none focus:ring-2 focus:ring-purple-500" placeholder="Ex: Casamento">
+                </div>
+            </div>
+
+            <!-- Upload -->
+            <div class="space-y-4">
+                <h2 class="text-lg font-semibold text-gray-700">2. Importar Faturas (PDF)</h2>
+                <label class="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-purple-300 rounded-xl cursor-pointer bg-purple-50 hover:bg-purple-100 transition">
+                    <span class="text-purple-600 font-medium">Toque para selecionar PDFs</span>
+                    <input type="file" id="file-input" class="hidden" multiple accept="application/pdf">
+                </label>
+            </div>
+
+            <button onclick="processPDFs()" class="w-full bg-purple-600 text-white font-bold py-4 rounded-xl shadow-lg hover:bg-purple-700 transition">
+                Analisar Faturas
+            </button>
+        </div>
+
+        <!-- Tela do Quiz -->
+        <div class="p-6 hidden space-y-4" id="quiz-screen">
+            <div class="flex justify-between items-center mb-2">
+                <h2 class="text-xl font-bold text-gray-800">Atribuir Gastos</h2>
+                <span class="bg-purple-100 text-purple-800 text-xs font-bold px-2 py-1 rounded-full" id="progress-badge">0/0</span>
+            </div>
+            
+            <div id="items-container" class="space-y-4">
+                <!-- Itens serão injetados aqui -->
+            </div>
+
+            <button onclick="exportToPDF()" class="w-full bg-green-500 text-white font-bold py-4 rounded-xl shadow-lg mt-8 hover:bg-green-600 transition flex justify-center items-center gap-2">
+                <span>Exportar Resumo (PDF)</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Footer Fixado com Totais -->
+    <div class="fixed bottom-0 w-full max-w-md bg-white border-t border-gray-200 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] p-4 flex justify-between items-center z-50">
+        <div>
+            <p class="text-xs text-gray-500" id="label-cat1">Cat 1</p>
+            <p class="text-lg font-bold text-purple-700" id="total-cat1">R$ 0,00</p>
+        </div>
+        <div>
+            <p class="text-xs text-gray-500" id="label-cat2">Cat 2</p>
+            <p class="text-lg font-bold text-purple-700" id="total-cat2">R$ 0,00</p>
+        </div>
+        <div class="text-right">
+            <p class="text-xs text-gray-500">Total Fatura</p>
+            <p class="text-lg font-bold text-gray-900" id="total-geral">R$ 0,00</p>
+        </div>
+    </div>
+
+    <script>
+        let expenses = [];
+        let category1 = "Meu Gasto";
+        let category2 = "Casamento";
+        let totals = { cat1: 0, cat2: 0, total: 0 };
+
+        async function processPDFs() {
+            category1 = document.getElementById('cat1').value || "Pessoa A";
+            category2 = document.getElementById('cat2').value || "Pessoa B";
+            
+            document.getElementById('label-cat1').innerText = category1;
+            document.getElementById('label-cat2').innerText = category2;
+
+            const files = document.getElementById('file-input').files;
+            if (files.length === 0) return alert("Selecione pelo menos um PDF.");
+
+            document.getElementById('setup-screen').classList.add('hidden');
+            document.getElementById('quiz-screen').classList.remove('hidden');
+
+            expenses = [];
+            
+            for (let file of files) {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    const textItems = textContent.items.map(item => item.str);
+                    const fullText = textItems.join(' ');
+
+                    // Expressão Regular simples para buscar os padrões de gastos da fatura
+                    // Procura por data (ex: 02 OUT), descrição e valor (R$ XX,XX)
+                    const regex = /(\d{2}\s+[A-Z]{3})\s+(.*?)\s+R\$\s*(\d+[.,]\d{2})/g;
+                    let match;
+                    
+                    while ((match = regex.exec(fullText)) !== null) {
+                        const date = match[1].trim();
+                        const desc = match[2].trim();
+                        // Ignorar pagamentos da própria fatura
+                        if(desc.toLowerCase().includes("pagamento em")) continue; 
+                        
+                        const valueStr = match[3].replace('.', '').replace(',', '.');
+                        const value = parseFloat(valueStr);
+
+                        expenses.push({ id: Math.random().toString(36).substr(2, 9), date, desc, value, assignedTo: null });
+                    }
+                }
+            }
+            renderQuiz();
+        }
+
+        function renderQuiz() {
+            const container = document.getElementById('items-container');
+            container.innerHTML = '';
+            
+            let assignedCount = expenses.filter(e => e.assignedTo !== null).length;
+            document.getElementById('progress-badge').innerText = `${assignedCount}/${expenses.length}`;
+
+            expenses.forEach((item, index) => {
+                const div = document.createElement('div');
+                div.className = "bg-white border rounded-xl p-4 shadow-sm";
+                
+                div.innerHTML = `
+                    <div class="flex justify-between items-start mb-3">
+                        <div>
+                            <span class="text-xs text-gray-400 font-medium">${item.date}</span>
+                            <p class="text-sm font-bold text-gray-800 leading-tight mt-1">${item.desc}</p>
+                        </div>
+                        <span class="text-lg font-extrabold text-gray-900 whitespace-nowrap ml-2">R$ ${item.value.toFixed(2).replace('.', ',')}</span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2 mt-2">
+                        <button onclick="assignItem('${item.id}', 'cat1')" class="py-2 rounded-lg text-sm font-bold border transition ${item.assignedTo === 'cat1' ? 'bg-purple-600 text-white border-purple-600' : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'}">
+                            ${category1}
+                        </button>
+                        <button onclick="assignItem('${item.id}', 'cat2')" class="py-2 rounded-lg text-sm font-bold border transition ${item.assignedTo === 'cat2' ? 'bg-purple-600 text-white border-purple-600' : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'}">
+                            ${category2}
+                        </button>
+                    </div>
+                `;
+                container.appendChild(div);
+            });
+            updateTotals();
+        }
+
+        function assignItem(id, cat) {
+            const item = expenses.find(e => e.id === id);
+            if (item) {
+                item.assignedTo = cat;
+                renderQuiz();
+            }
+        }
+
+        function updateTotals() {
+            totals = { cat1: 0, cat2: 0, total: 0 };
+            expenses.forEach(item => {
+                totals.total += item.value;
+                if (item.assignedTo === 'cat1') totals.cat1 += item.value;
+                if (item.assignedTo === 'cat2') totals.cat2 += item.value;
+            });
+
+            document.getElementById('total-cat1').innerText = `R$ ${totals.cat1.toFixed(2).replace('.', ',')}`;
+            document.getElementById('total-cat2').innerText = `R$ ${totals.cat2.toFixed(2).replace('.', ',')}`;
+            document.getElementById('total-geral').innerText = `R$ ${totals.total.toFixed(2).replace('.', ',')}`;
+        }
+
+        function exportToPDF() {
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF();
+
+            doc.setFontSize(20);
+            doc.text("Resumo de Fatura", 14, 22);
+            
+            doc.setFontSize(12);
+            doc.text(`Total Geral: R$ ${totals.total.toFixed(2).replace('.', ',')}`, 14, 32);
+            doc.text(`Total ${category1}: R$ ${totals.cat1.toFixed(2).replace('.', ',')}`, 14, 38);
+            doc.text(`Total ${category2}: R$ ${totals.cat2.toFixed(2).replace('.', ',')}`, 14, 44);
+
+            const tableData = expenses.map(item => [
+                item.date,
+                item.desc,
+                item.assignedTo === 'cat1' ? category1 : (item.assignedTo === 'cat2' ? category2 : 'Não atribuído'),
+                `R$ ${item.value.toFixed(2).replace('.', ',')}`
+            ]);
+
+            doc.autoTable({
+                startY: 50,
+                head: [['Data', 'Descrição', 'Categoria', 'Valor']],
+                body: tableData,
+                theme: 'striped',
+                headStyles: { fillColor: [107, 33, 168] } // Roxo Nubank
+            });
+
+            // O nome do arquivo ajuda a organizar caso a Sarinha queira baixar no celular dela também
+            doc.save(`Fatura_Dividida_${new Date().toLocaleDateString('pt-BR').replace(/\//g, '-')}.pdf`);
+        }
+    </script>
+</body>
+</html>
