@@ -38,9 +38,10 @@
                 <label class="flex flex-col items-center justify-center w-full h-36 border-2 border-dashed border-[#8A05BE] rounded-2xl cursor-pointer bg-purple-50 hover:bg-purple-100 transition shadow-sm text-center px-4">
                     <svg class="w-8 h-8 text-[#8A05BE] mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
                     <span class="text-[#8A05BE] font-bold text-lg">Selecionar arquivos</span>
-                    <span class="text-sm text-purple-500 font-medium mt-1">PDF, CSV ou OFX</span>
-                    <input type="file" id="file-input" class="hidden" multiple accept="application/pdf, .pdf, text/csv, .csv, application/x-ofx, .ofx">
+                    <span class="text-sm text-purple-500 font-medium mt-1">PDF, CSV, OFX ou prints/fotos</span>
+                    <input type="file" id="file-input" class="hidden" multiple accept="application/pdf, .pdf, text/csv, .csv, application/x-ofx, .ofx, image/*, .png, .jpg, .jpeg, .heic, .heif, .webp" onchange="updateFileCount()">
                 </label>
+                <p id="file-count" class="text-sm text-gray-500 font-medium text-center hidden"></p>
             </div>
 
             <button onclick="processFiles()" class="w-full bg-[#8A05BE] text-white font-bold text-lg py-4 rounded-2xl shadow-xl hover:bg-purple-800 transition transform hover:scale-[1.02]">
@@ -53,7 +54,16 @@
                 <h2 class="text-lg font-bold text-gray-800">Atribuir Gastos</h2>
                 <span class="bg-purple-100 text-[#8A05BE] text-sm font-black px-3 py-1 rounded-lg" id="progress-badge">0/0</span>
             </div>
-            
+
+            <div id="ocr-status" class="hidden bg-purple-50 border border-purple-100 rounded-xl p-4 space-y-2">
+                <p id="ocr-status-text" class="text-sm font-bold text-[#8A05BE]">Lendo prints...</p>
+                <div class="w-full bg-purple-100 rounded-full h-2 overflow-hidden">
+                    <div id="ocr-status-bar" class="bg-[#8A05BE] h-2 rounded-full transition-all" style="width: 0%"></div>
+                </div>
+            </div>
+
+            <div id="ocr-warning" class="hidden bg-amber-50 border border-amber-200 rounded-xl p-3 text-sm text-amber-800 font-medium"></div>
+
             <div id="items-container" class="space-y-4"></div>
 
             <button onclick="exportToPDF()" class="w-full bg-emerald-500 text-white font-bold text-lg py-4 rounded-2xl shadow-lg mt-8 hover:bg-emerald-600 transition flex justify-center items-center gap-2">
@@ -97,8 +107,11 @@
             document.getElementById('setup-screen').classList.add('hidden');
             document.getElementById('quiz-screen').classList.remove('hidden');
 
-            let rawExpenses = []; 
-            
+            let rawExpenses = [];
+            const imageFiles = [...files].filter(isImageFile);
+            let imageIndex = 0;
+            let imageResults = [];
+
             for (let file of files) {
                 const fileName = file.name.toLowerCase();
                 if (fileName.endsWith('.pdf')) {
@@ -107,9 +120,25 @@
                     await parseCSV(file, rawExpenses);
                 } else if (fileName.endsWith('.ofx')) {
                     await parseOFX(file, rawExpenses);
+                } else if (isImageFile(file)) {
+                    imageIndex++;
+                    try {
+                        const found = await parseImage(file, imageIndex, imageFiles.length);
+                        imageResults.push(found);
+                    } catch (err) {
+                        console.error(err);
+                        imageResults.push([]);
+                    }
                 }
             }
-            
+
+            if (imageFiles.length > 0) {
+                await finishOCR();
+                const merged = mergeImageResults(imageResults);
+                rawExpenses.push(...merged.items);
+                showOCRWarning(merged, imageResults);
+            }
+
             let balanceItemsSum = 0;
             const balanceKeywords = [
                 "pagamento recebido", "pagamento em ", "pagamento da fatura",
@@ -136,20 +165,21 @@
                         let installment = null;
                         
                         // NOVIDADE: Extração inteligente das Parcelas (ex: " - Parcela 10/12")
-                        const instMatch = descClean.match(/(?:\s*-\s*)?Parcela\s+(\d+)\/(\d+)/i);
+                        const instMatch = descClean.match(/(?:\s*-\s*)?Parc(?:ela)?\.?\s*(\d{1,2})\s*(?:\/|de)\s*(\d{1,2})\b/i);
                         if (instMatch) {
                             installment = `${instMatch[1]} de ${instMatch[2]}`;
                             // Remove a info de parcela do nome para ficar limpo
                             descClean = descClean.replace(instMatch[0], '').trim();
                         }
 
-                        expenses.push({ 
-                            id: Math.random().toString(36).substr(2, 9), 
-                            date: item.date, 
-                            desc: descClean, 
-                            value: absValue, 
+                        expenses.push({
+                            id: Math.random().toString(36).substr(2, 9),
+                            date: item.date,
+                            desc: descClean,
+                            value: absValue,
                             assignedTo: null,
-                            installment: installment
+                            installment: installment,
+                            fromImage: !!item.fromImage
                         });
                     }
                 }
@@ -265,6 +295,273 @@
             }
         }
 
+        // ===================== PRINTS E FOTOS (OCR LOCAL) =====================
+        // O texto da imagem é lido no próprio aparelho com Tesseract.js.
+        // A imagem não sai do celular; só a biblioteca e o idioma são baixados (1ª vez).
+
+        const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js';
+        let ocrWorker = null;
+        let ocrCurrent = { index: 0, total: 0 };
+
+        function updateFileCount() {
+            const files = document.getElementById('file-input').files;
+            const el = document.getElementById('file-count');
+            if (!files || files.length === 0) { el.classList.add('hidden'); return; }
+            const imgs = [...files].filter(isImageFile).length;
+            const others = files.length - imgs;
+            const parts = [];
+            if (others) parts.push(`${others} arquivo${others > 1 ? 's' : ''}`);
+            if (imgs) parts.push(`${imgs} print${imgs > 1 ? 's' : ''}/foto${imgs > 1 ? 's' : ''}`);
+            el.innerText = `Selecionado: ${parts.join(' e ')}`;
+            el.classList.remove('hidden');
+        }
+
+        function isImageFile(file) {
+            const name = file.name.toLowerCase();
+            return (file.type && file.type.startsWith('image/')) || /\.(png|jpe?g|heic|heif|webp|gif|bmp)$/.test(name);
+        }
+
+        function loadScript(src) {
+            return new Promise((resolve, reject) => {
+                if (document.querySelector(`script[src="${src}"]`)) return resolve();
+                const s = document.createElement('script');
+                s.src = src;
+                s.onload = resolve;
+                s.onerror = () => reject(new Error('Falha ao carregar ' + src));
+                document.head.appendChild(s);
+            });
+        }
+
+        function setOCRStatus(text, progress) {
+            document.getElementById('ocr-status').classList.remove('hidden');
+            document.getElementById('ocr-status-text').innerText = text;
+            if (typeof progress === 'number') {
+                document.getElementById('ocr-status-bar').style.width = `${Math.round(progress * 100)}%`;
+            }
+        }
+
+        function ocrLogger(m) {
+            const { index, total } = ocrCurrent;
+            const label = total > 1 ? `Lendo print ${index} de ${total}` : 'Lendo print';
+            if (m.status === 'recognizing text') {
+                setOCRStatus(`${label}... ${Math.round(m.progress * 100)}%`, ((index - 1) + m.progress) / total);
+            } else if (m.status && m.status.includes('traineddata')) {
+                setOCRStatus('Preparando leitor de imagens (só demora na 1ª vez)...', 0);
+            }
+        }
+
+        async function getOCRWorker() {
+            if (ocrWorker) return ocrWorker;
+            setOCRStatus('Preparando leitor de imagens (só demora na 1ª vez)...', 0);
+            await loadScript(TESSERACT_URL);
+            ocrWorker = await Tesseract.createWorker('por', 1, { logger: ocrLogger });
+            await ocrWorker.setParameters({
+                tessedit_pageseg_mode: '6',      // bloco único: mantém nome e valor na mesma linha
+                preserve_interword_spaces: '1'
+            });
+            return ocrWorker;
+        }
+
+        async function finishOCR() {
+            document.getElementById('ocr-status').classList.add('hidden');
+            if (ocrWorker) {
+                try { await ocrWorker.terminate(); } catch (e) {}
+                ocrWorker = null;
+            }
+        }
+
+        // Carrega a imagem, ajusta o tamanho, passa para tons de cinza e
+        // inverte as cores quando o print está em modo escuro.
+        function loadImageElement(file) {
+            return new Promise((resolve, reject) => {
+                const url = URL.createObjectURL(file);
+                const img = new Image();
+                img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+                img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Imagem não suportada: ' + file.name)); };
+                img.src = url;
+            });
+        }
+
+        async function preprocessImage(file) {
+            const img = await loadImageElement(file);
+            let w = img.naturalWidth, h = img.naturalHeight;
+            let scale = 1;
+            if (w > 2000) scale = 2000 / w;          // fotos grandes: reduz para ficar rápido
+            else if (w < 1000) scale = 1400 / w;     // prints pequenos: amplia para ler melhor
+            w = Math.round(w * scale); h = Math.round(h * scale);
+
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, 0, 0, w, h);
+
+            const data = ctx.getImageData(0, 0, w, h);
+            const px = data.data;
+            let sum = 0;
+            for (let i = 0; i < px.length; i += 4) {
+                const g = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+                px[i] = px[i + 1] = px[i + 2] = g;
+                sum += g;
+            }
+            const invert = (sum / (px.length / 4)) < 110;   // fundo escuro = modo escuro
+            for (let i = 0; i < px.length; i += 4) {
+                let g = invert ? 255 - px[i] : px[i];
+                g = Math.max(0, Math.min(255, (g - 128) * 1.4 + 128)); // mais contraste
+                px[i] = px[i + 1] = px[i + 2] = g;
+            }
+            ctx.putImageData(data, 0, 0);
+            return canvas;
+        }
+
+        async function parseImage(file, index, total) {
+            ocrCurrent = { index, total };
+            const worker = await getOCRWorker();
+            setOCRStatus(total > 1 ? `Lendo print ${index} de ${total}...` : 'Lendo print...', (index - 1) / total);
+            const canvas = await preprocessImage(file);
+            const { data } = await worker.recognize(canvas);
+            return parseOCRText(data.text || '');
+        }
+
+        // ---------- Interpretação do texto lido ----------
+        const OCR_MONTHS = ['JAN','FEV','MAR','ABR','MAI','JUN','JUL','AGO','SET','OUT','NOV','DEZ'];
+        const OCR_MONTH_RE = '(JAN|FEV|MAR|ABR|MAI|JUN|JUL|AGO|SET|OUT|NOV|DEZ)[A-ZÇ]*\\.?';
+
+        function ocrDayLabel(d) {
+            return `${String(d.getDate()).padStart(2, '0')} ${OCR_MONTHS[d.getMonth()]}`;
+        }
+
+        // Linhas de resumo/tela do app que não são lançamentos
+        const OCR_SKIP_RE = /\b(total|fatura (atual|fechada|aberta|anterior)|limite|dispon[ií]vel|vencimento|vence|fecha(mento)?|fechou|m[ií]nimo|pagar fatura|parcelar fatura|resumo|saldo)\b/i;
+        const OCR_CREDIT_RE = /(pagamento recebido|estorno|reembolso|devolu[cç][aã]o|cr[eé]dito de)/i;
+        const OCR_VALUE_RE = /([-−–]\s*)?(?:R\s?[$S5]\s*)?(\d{1,3}(?:[.\s]\d{3})*,\s?\d{2})(?!\d)/g;
+        const OCR_INST_RE = /Parc(?:ela)?\.?\s*(\d{1,2})\s*(?:\/|de)\s*(\d{1,2})\b/i;
+
+        function parseOCRText(text, today = new Date()) {
+            const items = [];
+            const yesterday = new Date(today.getTime() - 86400000);
+            let currentDate = 'Print';
+            let pending = [];   // linhas de texto sem valor (possível nome do item)
+
+            const lines = text.split(/\r?\n/).map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
+
+            for (let raw of lines) {
+                let line = raw;
+
+                // Cabeçalhos tipo "Fecha em 25 NOV" / "Vencimento 02/12": não são data de compra
+                if (OCR_SKIP_RE.test(line) && !OCR_VALUE_RE.test(line)) { OCR_VALUE_RE.lastIndex = 0; pending = []; continue; }
+                OCR_VALUE_RE.lastIndex = 0;
+
+                // Datas: "18 NOV", "18 de novembro", "18/11", "Hoje", "Ontem"
+                let lineDate = null;
+                const mMonth = line.match(new RegExp(`\\b(\\d{1,2})\\s*(?:de\\s+)?${OCR_MONTH_RE}(?:\\s*(?:de\\s+)?\\d{4})?`, 'i'));
+                const mNum = line.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+                if (/^(hoje)\b/i.test(line)) { lineDate = ocrDayLabel(today); line = line.replace(/^hoje\b/i, ''); }
+                else if (/^(ontem)\b/i.test(line)) { lineDate = ocrDayLabel(yesterday); line = line.replace(/^ontem\b/i, ''); }
+                else if (mMonth) {
+                    lineDate = `${mMonth[1].padStart(2, '0')} ${mMonth[2].toUpperCase()}`;
+                    line = line.replace(mMonth[0], ' ');
+                } else if (mNum && !OCR_INST_RE.test(line) && +mNum[2] >= 1 && +mNum[2] <= 12 && +mNum[1] >= 1 && +mNum[1] <= 31) {
+                    lineDate = `${mNum[1].padStart(2, '0')}/${mNum[2].padStart(2, '0')}${mNum[3] ? '/' + mNum[3] : ''}`;
+                    line = line.replace(mNum[0], ' ');
+                }
+
+                // Valores na linha (usa o último, que costuma ficar à direita)
+                const values = [...line.matchAll(OCR_VALUE_RE)];
+                const hasValue = values.length > 0;
+
+                if (lineDate && !hasValue) {
+                    currentDate = lineDate;
+                    pending = [];
+                    continue;
+                }
+
+                if (!hasValue) {
+                    const cleaned = cleanOCRDesc(line);
+                    // Linha só com "Parcela 2 de 3": pertence ao item anterior
+                    if (OCR_INST_RE.test(cleaned) && cleaned.replace(OCR_INST_RE, '').replace(/[^A-Za-zÀ-ú]/g, '').length < 3) {
+                        const last = items[items.length - 1];
+                        if (last && !OCR_INST_RE.test(last.desc)) {
+                            const m = cleaned.match(OCR_INST_RE);
+                            last.desc += ` - Parcela ${m[1]}/${m[2]}`;
+                        }
+                        continue;
+                    }
+                    if (cleaned.replace(/[^A-Za-zÀ-ú]/g, '').length >= 2) pending.push(cleaned);
+                    if (pending.length > 3) pending.shift();
+                    continue;
+                }
+
+                const v = values[values.length - 1];
+                const numStr = v[2].replace(/[.\s]/g, '').replace(',', '.');
+                let value = parseFloat(numStr);
+                if (isNaN(value) || value === 0) { pending = []; continue; }
+
+                let desc = line;
+                values.forEach(m => { desc = desc.replace(m[0], ' '); });
+                desc = cleanOCRDesc(desc);
+                if (desc.replace(/[^A-Za-zÀ-ú]/g, '').length < 2) desc = pending.length ? pending[pending.length - 1] : '';
+                pending = [];
+
+                if (!desc || OCR_SKIP_RE.test(desc)) continue;
+
+                const isNeg = !!v[1] || OCR_CREDIT_RE.test(desc);
+                if (isNeg) value = -value;
+
+                const inst = desc.match(OCR_INST_RE);
+                if (inst) desc = desc.replace(inst[0], '').trim() + ` - Parcela ${inst[1]}/${inst[2]}`;
+
+                items.push({ date: lineDate || currentDate, desc, rawValue: value, fromImage: true });
+                if (lineDate) currentDate = lineDate;
+            }
+            return items;
+        }
+
+        function cleanOCRDesc(s) {
+            return s
+                .replace(/\b\d{1,2}:\d{2}\b/g, ' ')          // horários
+                .replace(/^[^A-Za-zÀ-ú0-9]+/, '')             // lixo de ícones no começo
+                .replace(/[|©®°§¢»«<>{}\[\]_~^`]+/g, ' ')
+                .replace(/[^A-Za-zÀ-ú0-9)]+$/, '')            // lixo no fim
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        // Prints que se sobrepõem (rolando a tela) repetem itens.
+        // Para cada item, fica a maior quantidade vista em um único print.
+        function mergeImageResults(results) {
+            const keyOf = it => `${it.date}|${it.desc.toLowerCase().replace(/[^a-z0-9à-ú]/g, '')}|${it.rawValue.toFixed(2)}`;
+            const maxCount = new Map();
+            const firstSeen = new Map();
+            results.forEach(list => {
+                const local = new Map();
+                list.forEach(it => {
+                    const k = keyOf(it);
+                    local.set(k, (local.get(k) || 0) + 1);
+                    if (!firstSeen.has(k)) firstSeen.set(k, it);
+                });
+                local.forEach((c, k) => maxCount.set(k, Math.max(maxCount.get(k) || 0, c)));
+            });
+            const items = [];
+            let totalRead = 0;
+            results.forEach(l => totalRead += l.length);
+            maxCount.forEach((c, k) => { for (let i = 0; i < c; i++) items.push({ ...firstSeen.get(k) }); });
+            return { items, duplicates: totalRead - items.length };
+        }
+
+        function showOCRWarning(merged, results) {
+            const el = document.getElementById('ocr-warning');
+            const empty = results.filter(r => r.length === 0).length;
+            const msgs = [];
+            if (merged.items.length) msgs.push(`${merged.items.length} lançamento${merged.items.length > 1 ? 's' : ''} lido${merged.items.length > 1 ? 's' : ''} de print. Confira os valores marcados com "Print".`);
+            if (merged.duplicates > 0) msgs.push(`${merged.duplicates} repetido${merged.duplicates > 1 ? 's' : ''} entre prints ${merged.duplicates > 1 ? 'foram ignorados' : 'foi ignorado'}.`);
+            if (empty) msgs.push(`Não consegui ler lançamentos em ${empty} imagem${empty > 1 ? 'ns' : ''}.`);
+            if (!msgs.length) { el.classList.add('hidden'); return; }
+            el.innerText = msgs.join(' ');
+            el.classList.remove('hidden');
+        }
+        // =================== FIM PRINTS E FOTOS (OCR LOCAL) ===================
+
         function renderQuiz() {
             const container = document.getElementById('items-container');
             container.innerHTML = '';
@@ -285,6 +582,7 @@
                             <div class="flex items-center gap-2 mb-2 flex-wrap">
                                 <span class="text-[11px] text-gray-400 font-bold uppercase tracking-wider bg-gray-50 px-2 py-1 rounded-md">${item.date}</span>
                                 ${item.installment ? `<span class="text-[10px] text-blue-600 font-bold uppercase tracking-wider bg-blue-50 border border-blue-100 px-2 py-1 rounded-md">Parc. ${item.installment}</span>` : ''}
+                                ${item.fromImage ? `<span class="text-[10px] text-amber-700 font-bold uppercase tracking-wider bg-amber-50 border border-amber-100 px-2 py-1 rounded-md">Print</span>` : ''}
                             </div>
                             <p class="text-base font-bold text-gray-800 leading-snug truncate">${item.desc}</p>
                         </div>
